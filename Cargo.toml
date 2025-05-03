@@ -1,6 +1,6 @@
 [package]
 name = "randscape"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Patryk 'PsichiX' Budzynski <psichix@gmail.com>"]
 description = "PCG toolkit for grids processing"
@@ -14,9 +14,11 @@ exclude = ["resources/"]
 [dependencies]
 vek = "0.17"
 noise = "0.9"
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 image = "0.25"
+serde_json = "1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }

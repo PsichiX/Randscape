@@ -1,13 +1,15 @@
 pub mod third_party {
     pub use noise;
+    pub use serde;
     pub use vek;
 }
 
 use noise::NoiseFn;
+use serde::{Deserialize, Serialize};
 use std::ops::{Add, Div, Mul, Range, Sub};
 use vek::{Mat4, Vec2};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GridDirection {
     North,
     NorthEast,
@@ -19,7 +21,7 @@ pub enum GridDirection {
     NorthWest,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Grid<T: Copy> {
     size: Vec2<usize>,
     buffer: Vec<T>,
@@ -606,6 +608,7 @@ mod tests {
     };
     use image::{GrayImage, RgbImage};
     use noise::{Fbm, MultiFractal, ScalePoint, SuperSimplex, Worley};
+    use serde::{Deserialize, Serialize};
     use vek::Vec2;
 
     const SIZE: usize = 512;
@@ -800,5 +803,25 @@ mod tests {
             .collect();
         let image = GrayImage::from_vec(size.x as _, size.y as _, buffer).unwrap();
         image.save("./resources/caves.png").unwrap();
+    }
+
+    #[test]
+    fn test_serde() {
+        fn is_serde<T: Serialize + for<'d> Deserialize<'d>>() {}
+
+        is_serde::<Grid<usize>>();
+        is_serde::<Grid<f64>>();
+
+        let grid = Grid::new(Vec2::new(10, 10), 0usize);
+        let serialized = serde_json::to_string(&grid).unwrap();
+        let deserialized: Grid<usize> = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(grid.size, deserialized.size);
+        assert_eq!(grid.buffer, deserialized.buffer);
+
+        let grid = Grid::new(Vec2::new(10, 10), 0.0f64);
+        let serialized = serde_json::to_string(&grid).unwrap();
+        let deserialized: Grid<f64> = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(grid.size, deserialized.size);
+        assert_eq!(grid.buffer, deserialized.buffer);
     }
 }
