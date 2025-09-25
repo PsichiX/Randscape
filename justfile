@@ -8,15 +8,19 @@ format:
 build:
     cargo build
 
+build-wasm:
+    RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build --target wasm32-unknown-unknown
+
 clippy:
     cargo clippy
 
 test:
-    cargo test
+    cargo test --release
 
 checks:
     just format
     just build
+    just build-wasm
     just clippy
     just test
 
@@ -32,9 +36,6 @@ list-outdated:
 
 update:
     cargo update --aggressive
-
-example NAME="hello_world":
-    cargo run --all-features --example {{NAME}}
 
 publish:
     cargo publish --no-verify

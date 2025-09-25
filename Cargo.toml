@@ -1,6 +1,6 @@
 [package]
 name = "randscape"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 authors = ["Patryk 'PsichiX' Budzynski <psichix@gmail.com>"]
 description = "PCG toolkit for grids processing"
@@ -11,17 +11,24 @@ documentation = "https://docs.rs/randscape"
 readme = "README.md"
 exclude = ["resources/"]
 
+[features]
+default = ["diagnostics"]
+diagnostics = ["html-builder"]
+
 [dependencies]
 vek = "0.17"
 noise = "0.9"
 serde = { version = "1", features = ["derive"] }
+rand = "0.9"
+bitvec = "1"
+html-builder = { version = "0.5", optional = true }
 
 [dev-dependencies]
 image = "0.25"
 serde_json = "1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { version = "0.2", features = ["js"] }
+getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-getrandom = { version = "0.2" }
+getrandom = { version = "0.3" }
