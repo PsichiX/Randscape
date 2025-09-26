@@ -71,11 +71,11 @@ impl<T: Copy> Grid<T> {
     }
 
     pub fn view(&self, range: Range<Vec2<usize>>) -> GridView<'_, T> {
-        GridView::new(self, range)
+        GridView::new(self.size().x, &self.buffer, range)
     }
 
     pub fn view_mut(&mut self, range: Range<Vec2<usize>>) -> GridViewMut<'_, T> {
-        GridViewMut::new(self, range)
+        GridViewMut::new(self.size().x, &mut self.buffer, range)
     }
 
     pub fn generate(size: impl Into<Vec2<usize>>, generator: impl GridGenetator<T>) -> Self
@@ -350,18 +350,265 @@ impl<T: Copy + Display> std::fmt::Display for Grid<T> {
     }
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct FixedGrid<const W: usize, const H: usize, T: Copy> {
+    buffer: [[T; W]; H],
+}
+
+impl<const W: usize, const H: usize, T: Copy> FixedGrid<W, H, T> {
+    pub fn new(fill_value: T) -> Self {
+        Self {
+            buffer: [[fill_value; W]; H],
+        }
+    }
+
+    pub fn with_buffer(buffer: [[T; W]; H]) -> Self {
+        Self { buffer }
+    }
+
+    pub fn view(&self, range: Range<Vec2<usize>>) -> GridView<'_, T> {
+        GridView::new(self.size().x, self.as_slice(), range)
+    }
+
+    pub fn view_mut(&mut self, range: Range<Vec2<usize>>) -> GridViewMut<'_, T> {
+        GridViewMut::new(self.size().x, self.as_mut_slice(), range)
+    }
+
+    pub fn map<U: Copy>(&self, mut f: impl FnMut(Vec2<usize>, T) -> U) -> FixedGrid<W, H, U> {
+        FixedGrid {
+            buffer: std::array::from_fn(|y| {
+                std::array::from_fn(|x| f(Vec2::new(x, y), self.buffer[y][x]))
+            }),
+        }
+    }
+
+    pub fn into_inner(self) -> [[T; W]; H] {
+        self.buffer
+    }
+
+    pub fn size(&self) -> Vec2<usize> {
+        Vec2::new(W, H)
+    }
+
+    pub fn len(&self) -> usize {
+        W * H
+    }
+
+    pub fn is_empty(&self) -> bool {
+        W == 0 || H == 0
+    }
+
+    pub fn buffer(&self) -> &[[T; W]; H] {
+        &self.buffer
+    }
+
+    pub fn buffer_mut(&mut self) -> &mut [[T; W]; H] {
+        &mut self.buffer
+    }
+
+    pub fn as_slice(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.buffer.as_ptr() as *const T, W * H) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.buffer.as_mut_ptr() as *mut T, W * H) }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (Vec2<usize>, usize, T)> + '_ {
+        (0..H)
+            .flat_map(move |y| (0..W).map(move |x| (Vec2::new(x, y), y * W + x, self.buffer[y][x])))
+    }
+
+    pub fn location_offset(
+        &self,
+        location: impl Into<Vec2<usize>>,
+        direction: GridDirection,
+        distance: usize,
+    ) -> Option<Vec2<usize>> {
+        if distance == 0 {
+            return None;
+        }
+        let mut location = location.into();
+        match direction {
+            GridDirection::North => {
+                if let Some(y) = location.y.checked_sub(distance) {
+                    location.y = y;
+                } else {
+                    return None;
+                }
+            }
+            GridDirection::NorthEast => {
+                if location.x + distance < W {
+                    location.x += distance;
+                } else {
+                    return None;
+                }
+                if let Some(y) = location.y.checked_sub(distance) {
+                    location.y = y;
+                } else {
+                    return None;
+                }
+            }
+            GridDirection::East => {
+                if location.x + distance < W {
+                    location.x += distance;
+                } else {
+                    return None;
+                }
+            }
+            GridDirection::SouthEast => {
+                if location.x + distance < W {
+                    location.x += distance;
+                } else {
+                    return None;
+                }
+                if location.y + distance < H {
+                    location.y += distance;
+                } else {
+                    return None;
+                }
+            }
+            GridDirection::South => {
+                if location.y + distance < H {
+                    location.y += distance;
+                } else {
+                    return None;
+                }
+            }
+            GridDirection::SouthWest => {
+                if let Some(x) = location.x.checked_sub(distance) {
+                    location.x = x;
+                } else {
+                    return None;
+                }
+                if location.y + distance < H {
+                    location.y += distance;
+                } else {
+                    return None;
+                }
+            }
+            GridDirection::West => {
+                if let Some(x) = location.x.checked_sub(distance) {
+                    location.x = x;
+                } else {
+                    return None;
+                }
+            }
+            GridDirection::NorthWest => {
+                if let Some(x) = location.x.checked_sub(distance) {
+                    location.x = x;
+                } else {
+                    return None;
+                }
+                if let Some(y) = location.y.checked_sub(distance) {
+                    location.y = y;
+                } else {
+                    return None;
+                }
+            }
+        }
+        Some(location)
+    }
+
+    pub fn neighbors(
+        &self,
+        location: impl Into<Vec2<usize>>,
+        range: Range<usize>,
+    ) -> impl Iterator<Item = (GridDirection, Vec2<usize>, T)> + '_ {
+        let location = location.into();
+        range.flat_map(move |distance| {
+            [
+                GridDirection::North,
+                GridDirection::NorthEast,
+                GridDirection::East,
+                GridDirection::SouthEast,
+                GridDirection::South,
+                GridDirection::SouthWest,
+                GridDirection::West,
+                GridDirection::NorthWest,
+            ]
+            .into_iter()
+            .filter_map(move |direction| {
+                let location = self.location_offset(location, direction, distance)?;
+                Some((direction, location, self.buffer[location.y][location.x]))
+            })
+        })
+    }
+
+    pub fn get(&self, location: impl Into<Vec2<usize>>) -> Option<T> {
+        let location = location.into();
+        if location.x < W && location.y < H {
+            Some(self.buffer[location.y][location.x])
+        } else {
+            None
+        }
+    }
+
+    pub fn set(&mut self, location: impl Into<Vec2<usize>>, value: T) {
+        let location = location.into();
+        if location.x < W && location.y < H {
+            self.buffer[location.y][location.x] = value;
+        }
+    }
+
+    pub fn mirrored(&self, vertical: bool) -> Self {
+        let mut buffer = [[self.buffer[0][0]; W]; H];
+        for (y, row) in buffer.iter_mut().enumerate() {
+            for (x, cell) in row.iter_mut().enumerate() {
+                let src_x = if vertical { W - 1 - x } else { x };
+                let src_y = if vertical { y } else { H - 1 - y };
+                *cell = self.buffer[src_y][src_x];
+            }
+        }
+        Self { buffer }
+    }
+
+    pub fn rotated(&self, clockwise: bool) -> FixedGrid<H, W, T> {
+        let mut buffer = [[self.buffer[0][0]; H]; W];
+        for (y, row) in buffer.iter_mut().enumerate() {
+            for (x, cell) in row.iter_mut().enumerate() {
+                let src_x = if clockwise { y } else { W - 1 - y };
+                let src_y = if clockwise { H - 1 - x } else { x };
+                *cell = self.buffer[src_y][src_x];
+            }
+        }
+        FixedGrid { buffer }
+    }
+}
+
+impl<const W: usize, const H: usize, T: Copy + Display> std::fmt::Display for FixedGrid<W, H, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for y in 0..H {
+            for x in 0..W {
+                write!(f, "{} ", self.buffer[y][x])?;
+            }
+            writeln!(f)?;
+        }
+        Ok(())
+    }
+}
+
 pub struct GridView<'a, T: Copy> {
-    grid: &'a Grid<T>,
+    stride: usize,
+    cells: &'a [T],
     range: Range<Vec2<usize>>,
 }
 
 impl<'a, T: Copy> GridView<'a, T> {
-    pub fn new(grid: &'a Grid<T>, range: Range<Vec2<usize>>) -> Self {
-        Self { grid, range }
+    pub fn new(stride: usize, cells: &'a [T], range: Range<Vec2<usize>>) -> Self {
+        Self {
+            stride,
+            cells,
+            range,
+        }
     }
 
-    pub fn grid(&self) -> &'a Grid<T> {
-        self.grid
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
+    pub fn cells(&self) -> &[T] {
+        self.cells
     }
 
     pub fn range(&self) -> Range<Vec2<usize>> {
@@ -383,24 +630,16 @@ impl<'a, T: Copy> GridView<'a, T> {
         self.len() == 0
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (Vec2<usize>, usize, T)> + '_ {
-        self.grid
-            .iter()
-            .filter_map(move |(location, index, value)| {
-                if location.x >= self.range.start.x
-                    && location.x < self.range.end.x
-                    && location.y >= self.range.start.y
-                    && location.y < self.range.end.y
-                {
-                    let local_location = Vec2::new(
-                        location.x - self.range.start.x,
-                        location.y - self.range.start.y,
-                    );
-                    Some((local_location, index, value))
-                } else {
-                    None
-                }
+    pub fn iter(&self) -> impl Iterator<Item = (Vec2<usize>, usize, &T)> + '_ {
+        let Vec2 { x, y } = self.size();
+        (0..y).flat_map(move |local_y| {
+            (0..x).filter_map(move |local_x| {
+                let local_location = Vec2::new(local_x, local_y);
+                let grid_location = self.local_to_grid(local_location)?;
+                let index = grid_location.y * self.stride + grid_location.x;
+                Some((local_location, index, &self.cells[index]))
             })
+        })
     }
 
     pub fn grid_to_local(&self, location: impl Into<Vec2<usize>>) -> Option<Vec2<usize>> {
@@ -429,6 +668,13 @@ impl<'a, T: Copy> GridView<'a, T> {
         } else {
             None
         }
+    }
+
+    pub fn get(&self, location: impl Into<Vec2<usize>>) -> Option<&T> {
+        let location = location.into();
+        let grid_location = self.local_to_grid(location)?;
+        let index = grid_location.y * self.stride + grid_location.x;
+        self.cells.get(index)
     }
 }
 
@@ -437,8 +683,8 @@ impl<'a, T: Copy + Display> std::fmt::Display for GridView<'a, T> {
         for y in 0..self.size().y {
             for x in 0..self.size().x {
                 let location = self.local_to_grid(Vec2::new(x, y)).unwrap();
-                let index = self.grid.index(location);
-                write!(f, "{} ", self.grid.get(index).unwrap())?;
+                let index = location.y * self.stride + location.x;
+                write!(f, "{} ", self.cells[index])?;
             }
             writeln!(f)?;
         }
@@ -447,17 +693,30 @@ impl<'a, T: Copy + Display> std::fmt::Display for GridView<'a, T> {
 }
 
 pub struct GridViewMut<'a, T: Copy> {
-    grid: &'a mut Grid<T>,
+    stride: usize,
+    cells: &'a mut [T],
     range: Range<Vec2<usize>>,
 }
 
 impl<'a, T: Copy> GridViewMut<'a, T> {
-    pub fn new(grid: &'a mut Grid<T>, range: Range<Vec2<usize>>) -> Self {
-        Self { grid, range }
+    pub fn new(stride: usize, cells: &'a mut [T], range: Range<Vec2<usize>>) -> Self {
+        Self {
+            stride,
+            cells,
+            range,
+        }
     }
 
-    pub fn grid(&mut self) -> &mut Grid<T> {
-        self.grid
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
+    pub fn cells(&self) -> &[T] {
+        self.cells
+    }
+
+    pub fn cells_mut(&mut self) -> &mut [T] {
+        self.cells
     }
 
     pub fn range(&self) -> Range<Vec2<usize>> {
@@ -479,24 +738,40 @@ impl<'a, T: Copy> GridViewMut<'a, T> {
         self.len() == 0
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (Vec2<usize>, usize, T)> + '_ {
-        self.grid
-            .iter()
-            .filter_map(move |(location, index, value)| {
-                if location.x >= self.range.start.x
-                    && location.x < self.range.end.x
-                    && location.y >= self.range.start.y
-                    && location.y < self.range.end.y
-                {
-                    let local_location = Vec2::new(
-                        location.x - self.range.start.x,
-                        location.y - self.range.start.y,
-                    );
-                    Some((local_location, index, value))
-                } else {
-                    None
-                }
+    pub fn iter(&self) -> impl Iterator<Item = (Vec2<usize>, usize, &T)> + '_ {
+        let Vec2 { x, y } = self.size();
+        (0..y).flat_map(move |local_y| {
+            (0..x).filter_map(move |local_x| {
+                let local_location = Vec2::new(local_x, local_y);
+                let grid_location = self.local_to_grid(local_location)?;
+                let index = grid_location.y * self.stride + grid_location.x;
+                Some((local_location, index, &self.cells[index]))
             })
+        })
+    }
+
+    pub fn iter_mut(&'a mut self) -> impl Iterator<Item = (Vec2<usize>, usize, &'a mut T)> + 'a {
+        let stride = self.stride;
+        let range = self.range.clone();
+        let size = self.size();
+        let cells_ptr = self.cells.as_mut_ptr();
+        let cells_len = self.cells.len();
+        (0..size.y).flat_map(move |local_y| {
+            (0..size.x).filter_map(move |local_x| {
+                let local_location = Vec2::new(local_x, local_y);
+                let grid_location = Vec2::new(
+                    local_location.x + range.start.x,
+                    local_location.y + range.start.y,
+                );
+                if grid_location.x >= stride || grid_location.y * stride >= cells_len {
+                    return None;
+                }
+                let index = grid_location.y * stride + grid_location.x;
+                // SAFETY: We guarantee unique access by construction of the iterator.
+                let cell = unsafe { &mut *cells_ptr.add(index) };
+                Some((local_location, index, cell))
+            })
+        })
     }
 
     pub fn grid_to_local(&self, location: impl Into<Vec2<usize>>) -> Option<Vec2<usize>> {
@@ -526,6 +801,13 @@ impl<'a, T: Copy> GridViewMut<'a, T> {
             None
         }
     }
+
+    pub fn get(&self, location: impl Into<Vec2<usize>>) -> Option<&T> {
+        let location = location.into();
+        let grid_location = self.local_to_grid(location)?;
+        let index = grid_location.y * self.stride + grid_location.x;
+        self.cells.get(index)
+    }
 }
 
 impl<'a, T: Copy + Display> std::fmt::Display for GridViewMut<'a, T> {
@@ -533,8 +815,8 @@ impl<'a, T: Copy + Display> std::fmt::Display for GridViewMut<'a, T> {
         for y in 0..self.size().y {
             for x in 0..self.size().x {
                 let location = self.local_to_grid(Vec2::new(x, y)).unwrap();
-                let index = self.grid.index(location);
-                write!(f, "{} ", self.grid.get(index).unwrap())?;
+                let index = location.y * self.stride + location.x;
+                write!(f, "{} ", self.cells[index])?;
             }
             writeln!(f)?;
         }
@@ -705,15 +987,11 @@ mod tests {
         )
         .unwrap();
 
-        let b = Grid::with_buffer(
-            (3, 3),
-            vec![
-                10, 20, 30, //
-                11, 21, 31, //
-                12, 22, 32, //
-            ],
-        )
-        .unwrap();
+        let b = FixedGrid::<3, 3, _>::with_buffer([
+            [10, 20, 30], //
+            [11, 21, 31], //
+            [12, 22, 32], //
+        ]);
 
         let a_view = a.view(Vec2::new(1, 1)..Vec2::new(3, 3));
         let b_view = b.view(Vec2::new(0, 1)..Vec2::new(2, 3));

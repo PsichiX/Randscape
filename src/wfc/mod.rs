@@ -1,6 +1,6 @@
 pub mod diagnostics;
 
-use crate::grid::{Grid, GridDirection};
+use crate::grid::{FixedGrid, Grid, GridDirection};
 use bitvec::vec::BitVec;
 use rand::Rng;
 use std::{collections::BTreeMap, error::Error};
@@ -11,6 +11,12 @@ pub enum WfcError {
     WrongGridSize {
         expected: usize,
         provided: Vec2<usize>,
+    },
+    PatternSizeIsNotOdd {
+        provided: usize,
+    },
+    PatternSizeIsNotOne {
+        provided: usize,
     },
 }
 
@@ -24,6 +30,12 @@ impl std::fmt::Display for WfcError {
                     expected, provided
                 )
             }
+            Self::PatternSizeIsNotOdd { provided } => {
+                write!(f, "Pattern size is not odd: {}", provided)
+            }
+            Self::PatternSizeIsNotOne { provided } => {
+                write!(f, "Pattern size is not one: {}", provided)
+            }
         }
     }
 }
@@ -34,19 +46,19 @@ impl Error for WfcError {}
 pub struct PatternId(pub usize);
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Pattern<T: Copy> {
+pub struct Pattern<const N: usize, T: Copy> {
     id: PatternId,
-    grid: Grid<T>,
+    grid: FixedGrid<N, N, T>,
     frequency: usize,
     weight: f64,
 }
 
-impl<T: Copy> Pattern<T> {
+impl<const N: usize, T: Copy> Pattern<N, T> {
     pub fn id(&self) -> PatternId {
         self.id
     }
 
-    pub fn grid(&self) -> &Grid<T> {
+    pub fn grid(&self) -> &FixedGrid<N, N, T> {
         &self.grid
     }
 
@@ -102,29 +114,28 @@ pub struct WfcLearningStrategy {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WfcModel<const N: usize, T: Copy> {
-    patterns: Vec<Pattern<T>>,
+    patterns: Vec<Pattern<N, T>>,
     compatibility: BTreeMap<(PatternId, GridDirection), BitVec>,
     finalized: bool,
 }
 
-impl<const N: usize, T: Copy> Default for WfcModel<N, T> {
-    fn default() -> Self {
-        assert!(N % 2 == 1, "Pattern dimension N={} must be odd!", N);
-
-        Self {
+impl<const N: usize, T: Copy + Eq + Ord> WfcModel<N, T> {
+    pub fn new() -> Result<Self, WfcError> {
+        if N.is_multiple_of(2) {
+            return Err(WfcError::PatternSizeIsNotOdd { provided: N });
+        }
+        Ok(Self {
             patterns: Default::default(),
             compatibility: Default::default(),
             finalized: false,
-        }
+        })
     }
-}
 
-impl<const N: usize, T: Copy + Eq + Ord> WfcModel<N, T> {
-    pub fn patterns(&self) -> &[Pattern<T>] {
+    pub fn patterns(&self) -> &[Pattern<N, T>] {
         &self.patterns
     }
 
-    pub fn pattern(&self, id: PatternId) -> Option<&Pattern<T>> {
+    pub fn pattern(&self, id: PatternId) -> Option<&Pattern<N, T>> {
         self.patterns.iter().find(|p| p.id == id)
     }
 
@@ -132,7 +143,11 @@ impl<const N: usize, T: Copy + Eq + Ord> WfcModel<N, T> {
         &self.compatibility
     }
 
-    pub fn add_pattern(&mut self, grid: Grid<T>, frequency: usize) -> Result<PatternId, WfcError> {
+    pub fn add_pattern(
+        &mut self,
+        grid: FixedGrid<N, N, T>,
+        frequency: usize,
+    ) -> Result<PatternId, WfcError> {
         if grid.size().x != N || grid.size().y != N {
             return Err(WfcError::WrongGridSize {
                 expected: N,
@@ -191,25 +206,14 @@ impl<const N: usize, T: Copy + Eq + Ord> WfcModel<N, T> {
         self.finalized
     }
 
-    pub fn learn_preferred_from_grid(
-        &mut self,
-        grid: &Grid<T>,
-        learning_strategy: WfcLearningStrategy,
-    ) -> Result<(), WfcError> {
-        if N > 1 {
-            self.learn_overlapping_from_grid(grid, learning_strategy)
-        } else {
-            self.learn_tiling_from_grid(grid)
-        }
-    }
-
     pub fn learn_overlapping_from_grid(
         &mut self,
         grid: &Grid<T>,
         learning_strategy: WfcLearningStrategy,
     ) -> Result<(), WfcError> {
-        assert!(N % 2 == 1, "Pattern dimension N={} must be odd!", N);
-
+        if N.is_multiple_of(2) {
+            return Err(WfcError::PatternSizeIsNotOdd { provided: N });
+        }
         let xmax = if learning_strategy.periodic_input {
             grid.size().x
         } else {
@@ -223,32 +227,31 @@ impl<const N: usize, T: Copy + Eq + Ord> WfcModel<N, T> {
 
         for y in 0..ymax {
             for x in 0..xmax {
-                let mut pattern = Vec::with_capacity(N * N);
-                for dy in 0..N {
-                    for dx in 0..N {
+                let pattern = std::array::from_fn(|dy| {
+                    std::array::from_fn(|dx| {
                         let xx = (x + dx) % grid.size().x;
                         let yy = (y + dy) % grid.size().y;
-                        pattern.push(grid.get((xx, yy)).unwrap());
-                    }
-                }
-                let pattern = Grid::with_buffer((N, N), pattern).unwrap();
-                self.add_pattern(pattern.clone(), 1)?;
+                        grid.get((xx, yy)).unwrap()
+                    })
+                });
+                let pattern = FixedGrid::with_buffer(pattern);
+                self.add_pattern(pattern, 1)?;
 
                 if learning_strategy.augment_mirror_horizontal {
-                    let mirrored_h = pattern.mirrored(true).unwrap();
+                    let mirrored_h = pattern.mirrored(true);
                     self.add_pattern(mirrored_h, 1)?;
                 }
 
                 if learning_strategy.augment_mirror_vertical {
-                    let mirrored_v = pattern.mirrored(false).unwrap();
+                    let mirrored_v = pattern.mirrored(false);
                     self.add_pattern(mirrored_v, 1)?;
                 }
 
                 if learning_strategy.augment_rotate {
                     let mut pattern = pattern;
                     for _ in 0..3 {
-                        pattern = pattern.rotated(true).unwrap();
-                        self.add_pattern(pattern.clone(), 1)?;
+                        pattern = pattern.rotated(true);
+                        self.add_pattern(pattern, 1)?;
                     }
                 }
             }
@@ -270,44 +273,6 @@ impl<const N: usize, T: Copy + Eq + Ord> WfcModel<N, T> {
         }
 
         self.rebuild_overlapping_compatibility();
-        Ok(())
-    }
-
-    pub fn learn_tiling_from_grid(&mut self, grid: &Grid<T>) -> Result<(), WfcError> {
-        assert!(N == 1, "Pattern dimension N={} must be 1!", N);
-
-        let mut patterns = BTreeMap::new();
-
-        for y in 0..grid.size().y {
-            for x in 0..grid.size().x {
-                let pattern = Grid::with_buffer((1, 1), vec![grid.get((x, y)).unwrap()]).unwrap();
-                let id = self.add_pattern(pattern.clone(), 1)?;
-                patterns.insert((x, y), id);
-            }
-        }
-
-        for y in 0..grid.size().y {
-            for x in 0..grid.size().x {
-                let from = patterns.get(&(x, y)).cloned().unwrap();
-                if x < grid.size().x - 1 {
-                    let to = patterns.get(&(x + 1, y)).cloned().unwrap();
-                    self.allow_adjacency(from, to, GridDirection::East);
-                }
-                if x > 0 {
-                    let to = patterns.get(&(x - 1, y)).cloned().unwrap();
-                    self.allow_adjacency(from, to, GridDirection::West);
-                }
-                if y < grid.size().y - 1 {
-                    let to = patterns.get(&(x, y + 1)).cloned().unwrap();
-                    self.allow_adjacency(from, to, GridDirection::South);
-                }
-                if y > 0 {
-                    let to = patterns.get(&(x, y - 1)).cloned().unwrap();
-                    self.allow_adjacency(from, to, GridDirection::North);
-                }
-            }
-        }
-
         Ok(())
     }
 
@@ -343,7 +308,11 @@ impl<const N: usize, T: Copy + Eq + Ord> WfcModel<N, T> {
         }
     }
 
-    fn are_patterns_overlap_compatible(a: &Grid<T>, b: &Grid<T>, dir: GridDirection) -> bool {
+    fn are_patterns_overlap_compatible(
+        a: &FixedGrid<N, N, T>,
+        b: &FixedGrid<N, N, T>,
+        dir: GridDirection,
+    ) -> bool {
         if a.size() != b.size() {
             return false;
         }
@@ -714,7 +683,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut model = WfcModel::<3, _>::default();
+        let mut model = WfcModel::<3, _>::new().unwrap();
         model
             .learn_overlapping_from_grid(&grid, WfcLearningStrategy::default())
             .unwrap();
@@ -756,59 +725,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "diagnostics")]
-    fn test_model_tiled() {
-        let grid = Grid::with_buffer(
-            (5, 5),
-            vec![
-                0, 0, 0, 0, 0, //
-                0, 1, 1, 1, 0, //
-                0, 1, 0, 1, 0, //
-                0, 1, 1, 1, 0, //
-                0, 0, 0, 0, 0, //
-            ],
-        )
-        .unwrap();
-
-        let mut model = WfcModel::<1, _>::default();
-        model.learn_tiling_from_grid(&grid).unwrap();
-        model.finalize(WfcWeightingStrategy::Frequency);
-        std::fs::write(
-            "resources/wfc-model-tile.html",
-            model.diagnostics().unwrap(),
-        )
-        .unwrap();
-
-        let mut solver = WfcSolver::new((5, 5), &model);
-        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-
-        match solver.collapse(&model, &mut rng) {
-            WfcCollapseResult::Complete { grid } => {
-                assert_eq!(solver.iterations(), 26);
-                assert_eq!(
-                    grid.buffer(),
-                    vec![
-                        1, 1, 1, 0, 0, //
-                        0, 0, 0, 0, 0, //
-                        0, 0, 1, 1, 1, //
-                        1, 0, 0, 1, 0, //
-                        0, 0, 0, 0, 1, //
-                    ]
-                );
-            }
-            WfcCollapseResult::Impossible => {
-                panic!("WFC reported impossible for a solvable grid");
-            }
-            WfcCollapseResult::Incomplete => {
-                panic!("WFC reported incomplete after solve");
-            }
-            WfcCollapseResult::ModelNotFinalized => {
-                panic!("WFC model was not finalized");
-            }
-        }
-    }
-
-    #[test]
     fn test_wfc_learn_overlapping() {
         const OUTPUT_SIZE: Vec2<usize> = Vec2::new(40, 20);
 
@@ -829,7 +745,7 @@ mod tests {
         let grid = Grid::with_buffer((width as usize, height as usize), pixels).unwrap();
 
         println!("Learn patterns from image grid...");
-        let mut model = WfcModel::<3, _>::default();
+        let mut model = WfcModel::<3, _>::new().unwrap();
         model
             .learn_overlapping_from_grid(
                 &grid,
@@ -914,88 +830,6 @@ mod tests {
                 }
                 out_img
                     .save("resources/wfc-output-overlap.png")
-                    .expect("Failed to save output image");
-            }
-            WfcCollapseResult::Impossible => {
-                panic!("WFC reported impossible for image input");
-            }
-            WfcCollapseResult::Incomplete => {
-                panic!("WFC reported incomplete after solve");
-            }
-            WfcCollapseResult::ModelNotFinalized => {
-                panic!("WFC model was not finalized");
-            }
-        }
-    }
-
-    #[test]
-    fn test_wfc_learn_tiled() {
-        const OUTPUT_SIZE: Vec2<usize> = Vec2::new(40, 20);
-
-        println!("Load input image...");
-        let img = image::open("resources/wfc-input-tile.png").expect("Failed to open input image");
-        let (width, height) = img.dimensions();
-
-        println!("Turn input pixels into image grid...");
-        let mut pixels = Vec::with_capacity((width * height) as usize);
-        for y in 0..height {
-            for x in 0..width {
-                let p = img.get_pixel(x, y);
-                let p = p.channels();
-                pixels.push([p[0], p[1], p[2]]);
-            }
-        }
-        let grid = Grid::with_buffer((width as usize, height as usize), pixels).unwrap();
-
-        println!("Learn patterns from image grid...");
-        let mut model = WfcModel::<1, _>::default();
-        model.learn_tiling_from_grid(&grid).unwrap();
-        model.finalize(WfcWeightingStrategy::Frequency);
-        println!("Learned {} patterns", model.patterns().len());
-
-        println!("Solve WFC to generate output grid...");
-        let mut solver = WfcSolver::new(OUTPUT_SIZE, &model);
-
-        let mut rng = rand::rng();
-        let result = loop {
-            let (current, total) = solver.uncertainty();
-            match solver.collapse_step(&model, &mut rng) {
-                WfcCollapseResult::Incomplete => {
-                    println!(
-                        "WFC collapse | iterations: {} | uncertainty: {}/{}",
-                        solver.iterations(),
-                        current,
-                        total
-                    );
-                    continue;
-                }
-                result => {
-                    println!(
-                        "WFC collapsed | iterations: {} | uncertainty: {}/{}",
-                        solver.iterations(),
-                        current,
-                        total
-                    );
-                    break result;
-                }
-            }
-        };
-
-        println!("Handle WFC result...");
-        match result {
-            WfcCollapseResult::Complete { grid, .. } => {
-                let mut out_img = RgbaImage::new(OUTPUT_SIZE.x as u32, OUTPUT_SIZE.y as u32);
-                for y in 0..OUTPUT_SIZE.y {
-                    for x in 0..OUTPUT_SIZE.x {
-                        let pixel = grid.get((x, y)).unwrap();
-                        let r = pixel[0];
-                        let g = pixel[1];
-                        let b = pixel[2];
-                        out_img.put_pixel(x as u32, y as u32, image::Rgba([r, g, b, 255]));
-                    }
-                }
-                out_img
-                    .save("resources/wfc-output-tile.png")
                     .expect("Failed to save output image");
             }
             WfcCollapseResult::Impossible => {

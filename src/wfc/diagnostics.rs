@@ -7,7 +7,7 @@ use crate::{
 use html_builder::{Buffer, Html5, Node};
 use std::{error::Error, fmt::Write};
 
-impl<T: Copy> Pattern<T> {
+impl<const N: usize, T: Copy> Pattern<N, T> {
     pub fn diagnostics(&self, container: &mut Node) -> Result<(), Box<dyn Error>>
     where
         T: std::fmt::Display,
