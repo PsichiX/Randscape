@@ -171,7 +171,16 @@ impl<T: Copy> Grid<T> {
 
     pub fn index(&self, location: impl Into<Vec2<usize>>) -> usize {
         let location = location.into();
-        (location.y % self.size.y) * self.size.x + (location.x % self.size.x)
+        location.y * self.size.x + location.x
+    }
+
+    pub fn safe_index(&self, location: impl Into<Vec2<usize>>) -> Option<usize> {
+        let location = location.into();
+        if location.x < self.size.x && location.y < self.size.y {
+            Some(location.y * self.size.x + location.x)
+        } else {
+            None
+        }
     }
 
     pub fn location(&self, index: usize) -> Vec2<usize> {
@@ -313,8 +322,11 @@ impl<T: Copy> Grid<T> {
         let mut buffer = Vec::with_capacity(self.buffer.len());
         for y in 0..self.size.y {
             for x in 0..self.size.x {
-                let src_x = if vertical { self.size.x - 1 - x } else { x };
-                let src_y = if vertical { y } else { self.size.y - 1 - y };
+                let (src_x, src_y) = if vertical {
+                    (x, self.size.y - 1 - y)
+                } else {
+                    (self.size.x - 1 - x, y)
+                };
                 let index = self.index(Vec2::new(src_x, src_y));
                 buffer.push(self.buffer[index]);
             }
@@ -326,10 +338,30 @@ impl<T: Copy> Grid<T> {
         let mut buffer = Vec::with_capacity(self.buffer.len());
         for y in 0..self.size.x {
             for x in 0..self.size.y {
-                let src_x = if clockwise { y } else { self.size.x - 1 - y };
-                let src_y = if clockwise { self.size.y - 1 - x } else { x };
+                let (src_x, src_y) = if clockwise {
+                    (y, self.size.x - 1 - x)
+                } else {
+                    (self.size.y - 1 - y, x)
+                };
                 let index = self.index(Vec2::new(src_x, src_y));
                 buffer.push(self.buffer[index]);
+            }
+        }
+        let new_size = Vec2::new(self.size.y, self.size.x);
+        Self::with_buffer(new_size, buffer)
+    }
+
+    pub fn shifted(&self, direction: GridDirection) -> Option<Self> {
+        let mut buffer = Vec::with_capacity(self.buffer.len());
+        for y in 0..self.size.x {
+            for x in 0..self.size.y {
+                let src = self.location_offset(Vec2::new(x, y), direction.opposite(), 1);
+                let value = if let Some(src) = src {
+                    self.buffer[src.y * self.size.x + src.x]
+                } else {
+                    self.buffer[y * self.size.x + x]
+                };
+                buffer.push(value);
             }
         }
         let new_size = Vec2::new(self.size.y, self.size.x);
@@ -555,8 +587,11 @@ impl<const W: usize, const H: usize, T: Copy> FixedGrid<W, H, T> {
         let mut buffer = [[self.buffer[0][0]; W]; H];
         for (y, row) in buffer.iter_mut().enumerate() {
             for (x, cell) in row.iter_mut().enumerate() {
-                let src_x = if vertical { W - 1 - x } else { x };
-                let src_y = if vertical { y } else { H - 1 - y };
+                let (src_x, src_y) = if vertical {
+                    (x, H - 1 - y)
+                } else {
+                    (W - 1 - x, y)
+                };
                 *cell = self.buffer[src_y][src_x];
             }
         }
@@ -567,12 +602,29 @@ impl<const W: usize, const H: usize, T: Copy> FixedGrid<W, H, T> {
         let mut buffer = [[self.buffer[0][0]; H]; W];
         for (y, row) in buffer.iter_mut().enumerate() {
             for (x, cell) in row.iter_mut().enumerate() {
-                let src_x = if clockwise { y } else { W - 1 - y };
-                let src_y = if clockwise { H - 1 - x } else { x };
+                let (src_x, src_y) = if clockwise {
+                    (y, H - 1 - x)
+                } else {
+                    (W - 1 - y, x)
+                };
                 *cell = self.buffer[src_y][src_x];
             }
         }
         FixedGrid { buffer }
+    }
+
+    pub fn shifted(&self, direction: GridDirection) -> Self {
+        let buffer = std::array::from_fn(|row| {
+            std::array::from_fn(|col| {
+                let src = self.location_offset(Vec2::new(col, row), direction.opposite(), 1);
+                if let Some(src) = src {
+                    self.buffer[src.y][src.x]
+                } else {
+                    self.buffer[row][col]
+                }
+            })
+        });
+        Self { buffer }
     }
 }
 
@@ -830,7 +882,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_mirrored() {
+    fn test_mirrored_grid() {
         let grid = Grid::with_buffer(
             Vec2::new(3, 3),
             vec![
@@ -841,33 +893,13 @@ mod tests {
         )
         .unwrap();
 
-        let mirrored = grid.mirrored(false).unwrap();
-        assert_eq!(
-            mirrored.buffer(),
-            &[
-                20, 21, 22, //
-                10, 11, 12, //
-                00, 01, 02, //
-            ]
-        );
-
-        let mirrored = mirrored.mirrored(false).unwrap();
-        assert_eq!(
-            mirrored.buffer(),
-            &[
-                00, 01, 02, //
-                10, 11, 12, //
-                20, 21, 22, //
-            ]
-        );
-
         let mirrored = grid.mirrored(true).unwrap();
         assert_eq!(
             mirrored.buffer(),
             &[
-                02, 01, 00, //
-                12, 11, 10, //
-                22, 21, 20, //
+                20, 21, 22, //
+                10, 11, 12, //
+                00, 01, 02, //
             ]
         );
 
@@ -880,10 +912,79 @@ mod tests {
                 20, 21, 22, //
             ]
         );
+
+        let mirrored = grid.mirrored(false).unwrap();
+        assert_eq!(
+            mirrored.buffer(),
+            &[
+                02, 01, 00, //
+                12, 11, 10, //
+                22, 21, 20, //
+            ]
+        );
+
+        let mirrored = mirrored.mirrored(false).unwrap();
+        assert_eq!(
+            mirrored.buffer(),
+            &[
+                00, 01, 02, //
+                10, 11, 12, //
+                20, 21, 22, //
+            ]
+        );
     }
 
     #[test]
-    fn test_rotated() {
+    fn test_mirrored_fixed_grid() {
+        let grid = FixedGrid::<3, 3, _>::with_buffer([
+            [00, 01, 02], //
+            [10, 11, 12], //
+            [20, 21, 22], //
+        ]);
+
+        let mirrored = grid.mirrored(true);
+        assert_eq!(
+            mirrored.buffer(),
+            &[
+                [20, 21, 22], //
+                [10, 11, 12], //
+                [00, 01, 02], //
+            ]
+        );
+
+        let mirrored = mirrored.mirrored(true);
+        assert_eq!(
+            mirrored.buffer(),
+            &[
+                [00, 01, 02], //
+                [10, 11, 12], //
+                [20, 21, 22], //
+            ]
+        );
+
+        let mirrored = grid.mirrored(false);
+        assert_eq!(
+            mirrored.buffer(),
+            &[
+                [02, 01, 00], //
+                [12, 11, 10], //
+                [22, 21, 20], //
+            ]
+        );
+
+        let mirrored = mirrored.mirrored(false);
+        assert_eq!(
+            mirrored.buffer(),
+            &[
+                [00, 01, 02], //
+                [10, 11, 12], //
+                [20, 21, 22], //
+            ]
+        );
+    }
+
+    #[test]
+    fn test_rotated_grid() {
         let grid = Grid::with_buffer(
             Vec2::new(3, 3),
             vec![
@@ -971,6 +1072,148 @@ mod tests {
                 00, 01, 02, //
                 10, 11, 12, //
                 20, 21, 22, //
+            ]
+        );
+    }
+
+    #[test]
+    fn test_rotated_fixed_grid() {
+        let grid = FixedGrid::<3, 3, _>::with_buffer([
+            [00, 01, 02], //
+            [10, 11, 12], //
+            [20, 21, 22], //
+        ]);
+
+        let rotated = grid.rotated(true);
+        assert_eq!(
+            rotated.buffer(),
+            &[
+                [20, 10, 00], //
+                [21, 11, 01], //
+                [22, 12, 02], //
+            ]
+        );
+
+        let rotated = rotated.rotated(true);
+        assert_eq!(
+            rotated.buffer(),
+            &[
+                [22, 21, 20], //
+                [12, 11, 10], //
+                [02, 01, 00], //
+            ]
+        );
+
+        let rotated = rotated.rotated(true);
+        assert_eq!(
+            rotated.buffer(),
+            &[
+                [02, 12, 22], //
+                [01, 11, 21], //
+                [00, 10, 20], //
+            ]
+        );
+
+        let rotated = rotated.rotated(true);
+        assert_eq!(
+            rotated.buffer(),
+            &[
+                [00, 01, 02], //
+                [10, 11, 12], //
+                [20, 21, 22], //
+            ]
+        );
+
+        let rotated = grid.rotated(false);
+        assert_eq!(
+            rotated.buffer(),
+            &[
+                [02, 12, 22], //
+                [01, 11, 21], //
+                [00, 10, 20], //
+            ]
+        );
+
+        let rotated = rotated.rotated(false);
+        assert_eq!(
+            rotated.buffer(),
+            &[
+                [22, 21, 20], //
+                [12, 11, 10], //
+                [02, 01, 00], //
+            ]
+        );
+
+        let rotated = rotated.rotated(false);
+        assert_eq!(
+            rotated.buffer(),
+            &[
+                [20, 10, 00], //
+                [21, 11, 01], //
+                [22, 12, 02], //
+            ]
+        );
+
+        let rotated = rotated.rotated(false);
+        assert_eq!(
+            rotated.buffer(),
+            &[
+                [00, 01, 02], //
+                [10, 11, 12], //
+                [20, 21, 22], //
+            ]
+        );
+    }
+
+    #[test]
+    fn test_shifted() {
+        let a = Grid::with_buffer(
+            Vec2::new(3, 3),
+            vec![
+                00, 01, 02, //
+                10, 11, 12, //
+                20, 21, 22, //
+            ],
+        )
+        .unwrap();
+
+        let b = a.shifted(GridDirection::North).unwrap();
+        assert_eq!(
+            b.buffer(),
+            &[
+                10, 11, 12, //
+                20, 21, 22, //
+                20, 21, 22, //
+            ]
+        );
+
+        let b = a.shifted(GridDirection::West).unwrap();
+        assert_eq!(
+            b.buffer(),
+            &[
+                01, 02, 02, //
+                11, 12, 12, //
+                21, 22, 22, //
+            ]
+        );
+
+        let b = a.shifted(GridDirection::South).unwrap();
+        assert_eq!(
+            b.buffer(),
+            &[
+                00, 01, 02, //
+                00, 01, 02, //
+                10, 11, 12, //
+            ]
+        );
+
+        let b = a.shifted(GridDirection::East).unwrap();
+        assert_eq!(
+            b.buffer(),
+            &[
+                00, 00, 01, //
+                10, 10, 11, //
+                20, 20, 21, //
             ]
         );
     }

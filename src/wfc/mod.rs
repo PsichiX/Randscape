@@ -3,13 +3,22 @@ pub mod diagnostics;
 use crate::grid::{FixedGrid, Grid, GridDirection};
 use bitvec::vec::BitVec;
 use rand::Rng;
-use std::{collections::BTreeMap, error::Error};
+use std::{
+    collections::BTreeMap,
+    error::Error,
+    pin::Pin,
+    task::{Context, Poll},
+};
 use vek::Vec2;
 
 #[derive(Debug)]
 pub enum WfcError {
     WrongGridSize {
-        expected: usize,
+        expected: Vec2<usize>,
+        provided: Vec2<usize>,
+    },
+    WrongGridLocation {
+        bounds: Vec2<usize>,
         provided: Vec2<usize>,
     },
     PatternSizeIsNotOdd {
@@ -28,6 +37,13 @@ impl std::fmt::Display for WfcError {
                     f,
                     "Wrong grid size: expected {}, provided {}",
                     expected, provided
+                )
+            }
+            Self::WrongGridLocation { bounds, provided } => {
+                write!(
+                    f,
+                    "Wrong grid location: bounds {}, provided {}",
+                    bounds, provided
                 )
             }
             Self::PatternSizeIsNotOdd { provided } => {
@@ -104,12 +120,45 @@ pub enum WfcPatternPruningStrategy {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
-pub struct WfcLearningStrategy {
-    pub periodic_input: bool,
+pub struct WfcOverlappingLearningStrategy {
+    pub periodic_horizontal: bool,
+    pub periodic_vertical: bool,
     pub augment_mirror_horizontal: bool,
     pub augment_mirror_vertical: bool,
     pub augment_rotate: bool,
     pub pattern_pruning: WfcPatternPruningStrategy,
+}
+
+impl WfcOverlappingLearningStrategy {
+    pub fn periodic_horizontal(mut self, value: bool) -> Self {
+        self.periodic_horizontal = value;
+        self
+    }
+
+    pub fn periodic_vertical(mut self, value: bool) -> Self {
+        self.periodic_vertical = value;
+        self
+    }
+
+    pub fn augment_mirror_horizontal(mut self, value: bool) -> Self {
+        self.augment_mirror_horizontal = value;
+        self
+    }
+
+    pub fn augment_mirror_vertical(mut self, value: bool) -> Self {
+        self.augment_mirror_vertical = value;
+        self
+    }
+
+    pub fn augment_rotate(mut self, value: bool) -> Self {
+        self.augment_rotate = value;
+        self
+    }
+
+    pub fn pattern_pruning(mut self, strategy: WfcPatternPruningStrategy) -> Self {
+        self.pattern_pruning = strategy;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -131,6 +180,71 @@ impl<const N: usize, T: Copy + Eq + Ord> WfcModel<N, T> {
         })
     }
 
+    pub fn new_overlapping_from_grid(
+        grid: &Grid<T>,
+        learning_strategy: WfcOverlappingLearningStrategy,
+    ) -> Result<Self, WfcError> {
+        let mut result = Self::new()?;
+        let size = grid.size();
+        for y in 0..size.y {
+            for x in 0..size.x {
+                let pattern = std::array::from_fn(|dy| {
+                    std::array::from_fn(|dx| {
+                        let xx = if learning_strategy.periodic_horizontal {
+                            ((x + dx + size.x) as isize - (N as isize / 2)) as usize % size.x
+                        } else {
+                            (((x + dx) as isize - (N as isize / 2)).max(0) as usize).min(size.x - 1)
+                        };
+                        let yy = if learning_strategy.periodic_vertical {
+                            ((y + dy + size.y) as isize - (N as isize / 2)) as usize % size.y
+                        } else {
+                            (((y + dy) as isize - (N as isize / 2)).max(0) as usize).min(size.y - 1)
+                        };
+                        grid.get((xx, yy)).unwrap()
+                    })
+                });
+                let pattern = FixedGrid::with_buffer(pattern);
+                result.add_pattern(pattern, 1)?;
+
+                if learning_strategy.augment_mirror_horizontal {
+                    let pattern = pattern.mirrored(false);
+                    result.add_pattern(pattern, 1)?;
+                }
+
+                if learning_strategy.augment_mirror_vertical {
+                    let pattern = pattern.mirrored(true);
+                    result.add_pattern(pattern, 1)?;
+                }
+
+                if learning_strategy.augment_rotate {
+                    let mut pattern = pattern;
+                    for _ in 0..3 {
+                        pattern = pattern.rotated(true);
+                        result.add_pattern(pattern, 1)?;
+                    }
+                }
+            }
+        }
+
+        let total_frequency: usize = result.patterns.iter().map(|p| p.frequency).sum();
+        match learning_strategy.pattern_pruning {
+            WfcPatternPruningStrategy::None => {}
+            WfcPatternPruningStrategy::FrequencyThreshold(threshold) => {
+                result.patterns.retain(|p| p.frequency >= threshold);
+            }
+            WfcPatternPruningStrategy::FrequencyFraction(fraction) => {
+                let threshold = (total_frequency as f64 * fraction).ceil() as usize;
+                result.patterns.retain(|p| p.frequency >= threshold);
+            }
+        }
+        for index in 0..result.patterns.len() {
+            result.patterns[index].id = PatternId(index);
+        }
+
+        result.rebuild_overlapping_compatibility();
+        Ok(result)
+    }
+
     pub fn patterns(&self) -> &[Pattern<N, T>] {
         &self.patterns
     }
@@ -150,7 +264,7 @@ impl<const N: usize, T: Copy + Eq + Ord> WfcModel<N, T> {
     ) -> Result<PatternId, WfcError> {
         if grid.size().x != N || grid.size().y != N {
             return Err(WfcError::WrongGridSize {
-                expected: N,
+                expected: Vec2::new(N, N),
                 provided: grid.size(),
             });
         }
@@ -206,82 +320,10 @@ impl<const N: usize, T: Copy + Eq + Ord> WfcModel<N, T> {
         self.finalized
     }
 
-    pub fn learn_overlapping_from_grid(
-        &mut self,
-        grid: &Grid<T>,
-        learning_strategy: WfcLearningStrategy,
-    ) -> Result<(), WfcError> {
-        if N.is_multiple_of(2) {
-            return Err(WfcError::PatternSizeIsNotOdd { provided: N });
-        }
-        let xmax = if learning_strategy.periodic_input {
-            grid.size().x
-        } else {
-            grid.size().x - N + 1
-        };
-        let ymax = if learning_strategy.periodic_input {
-            grid.size().y
-        } else {
-            grid.size().y - N + 1
-        };
-
-        for y in 0..ymax {
-            for x in 0..xmax {
-                let pattern = std::array::from_fn(|dy| {
-                    std::array::from_fn(|dx| {
-                        let xx = (x + dx) % grid.size().x;
-                        let yy = (y + dy) % grid.size().y;
-                        grid.get((xx, yy)).unwrap()
-                    })
-                });
-                let pattern = FixedGrid::with_buffer(pattern);
-                self.add_pattern(pattern, 1)?;
-
-                if learning_strategy.augment_mirror_horizontal {
-                    let mirrored_h = pattern.mirrored(true);
-                    self.add_pattern(mirrored_h, 1)?;
-                }
-
-                if learning_strategy.augment_mirror_vertical {
-                    let mirrored_v = pattern.mirrored(false);
-                    self.add_pattern(mirrored_v, 1)?;
-                }
-
-                if learning_strategy.augment_rotate {
-                    let mut pattern = pattern;
-                    for _ in 0..3 {
-                        pattern = pattern.rotated(true);
-                        self.add_pattern(pattern, 1)?;
-                    }
-                }
-            }
-        }
-
-        let total_frequency: usize = self.patterns.iter().map(|p| p.frequency).sum();
-        match learning_strategy.pattern_pruning {
-            WfcPatternPruningStrategy::None => {}
-            WfcPatternPruningStrategy::FrequencyThreshold(threshold) => {
-                self.patterns.retain(|p| p.frequency >= threshold);
-            }
-            WfcPatternPruningStrategy::FrequencyFraction(fraction) => {
-                let threshold = (total_frequency as f64 * fraction).ceil() as usize;
-                self.patterns.retain(|p| p.frequency >= threshold);
-            }
-        }
-        for index in 0..self.patterns.len() {
-            self.patterns[index].id = PatternId(index);
-        }
-
-        self.rebuild_overlapping_compatibility();
-        Ok(())
-    }
-
     pub fn merge(&mut self, other: WfcModel<N, T>) -> Result<(), WfcError> {
         for pattern in other.patterns {
             self.add_pattern(pattern.grid, pattern.frequency)?;
         }
-
-        self.rebuild_overlapping_compatibility();
         Ok(())
     }
 
@@ -362,37 +404,30 @@ impl<const N: usize, T: Copy + Eq + Ord> WfcModel<N, T> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WfcCollapseResult<T: Copy> {
-    Incomplete,
     Complete { grid: Grid<T> },
     Impossible,
     ModelNotFinalized,
 }
 
-pub struct WfcCellModifier<'a, const N: usize, T: Copy> {
+pub struct WfcCellModifier<'a> {
     solver: &'a mut WfcSolver,
     index: usize,
-    model: &'a WfcModel<N, T>,
+    possibilities: BitVec,
 }
 
-impl<'a, const N: usize, T: Copy> Drop for WfcCellModifier<'a, N, T> {
-    fn drop(&mut self) {
-        self.solver.propagate(self.model);
-    }
-}
-
-impl<'a, const N: usize, T: Copy> WfcCellModifier<'a, N, T> {
+impl<'a> WfcCellModifier<'a> {
     pub fn clear(&mut self) -> &mut Self {
-        self.solver.possibility_space[self.index].fill(false);
+        self.possibilities.fill(false);
         self
     }
 
     pub fn all(&mut self) -> &mut Self {
-        self.solver.possibility_space[self.index].fill(true);
+        self.possibilities.fill(true);
         self
     }
 
     pub fn allow(&mut self, pattern: PatternId) -> &mut Self {
-        let cell = &mut self.solver.possibility_space[self.index];
+        let cell = &mut self.possibilities;
         if pattern.0 < cell.len() {
             cell.set(pattern.0, true);
         }
@@ -400,11 +435,20 @@ impl<'a, const N: usize, T: Copy> WfcCellModifier<'a, N, T> {
     }
 
     pub fn forbid(&mut self, pattern: PatternId) -> &mut Self {
-        let cell = &mut self.solver.possibility_space[self.index];
+        let cell = &mut self.possibilities;
         if pattern.0 < cell.len() {
             cell.set(pattern.0, false);
         }
         self
+    }
+
+    pub async fn commit<const N: usize, T: Copy>(
+        self,
+        model: &'a WfcModel<N, T>,
+    ) -> &'a mut WfcSolver {
+        self.solver.possibility_space[self.index] = self.possibilities;
+        self.solver.propagate(model, 0).await;
+        self.solver
     }
 }
 
@@ -434,33 +478,50 @@ impl WfcSolver {
         self
     }
 
-    pub fn modify_cell<'a, const N: usize, T: Copy>(
-        &'a mut self,
-        model: &'a WfcModel<N, T>,
-        location: impl Into<Vec2<usize>>,
-    ) -> WfcCellModifier<'a, N, T> {
-        let location = location.into();
-        let index = self.index(location.x, location.y);
-        WfcCellModifier {
-            solver: self,
-            index,
-            model,
-        }
+    pub fn reset_cells<const N: usize, T: Copy>(&mut self, model: &WfcModel<N, T>) {
+        self.possibility_space
+            .iter_mut()
+            .for_each(|bv| *bv = BitVec::repeat(true, model.patterns.len()));
     }
 
-    pub fn set_cell<const N: usize, T: Copy>(
+    pub fn modify_cell<'a>(
+        &'a mut self,
+        location: impl Into<Vec2<usize>>,
+    ) -> Result<WfcCellModifier<'a>, WfcError> {
+        let location = location.into();
+        let index = self
+            .safe_index(location.x, location.y)
+            .ok_or(WfcError::WrongGridLocation {
+                bounds: self.size,
+                provided: location,
+            })?;
+        Ok(WfcCellModifier {
+            possibilities: self.possibility_space[index].clone(),
+            solver: self,
+            index,
+        })
+    }
+
+    pub async fn set_cell<const N: usize, T: Copy>(
         &mut self,
         model: &WfcModel<N, T>,
         location: impl Into<Vec2<usize>>,
         allowed: &[PatternId],
-    ) {
+        propagation_budget: usize,
+    ) -> Result<(), WfcError> {
         let location = location.into();
-        let idx = self.index(location.x, location.y);
+        let idx = self
+            .safe_index(location.x, location.y)
+            .ok_or(WfcError::WrongGridLocation {
+                bounds: self.size,
+                provided: location,
+            })?;
         self.possibility_space[idx].fill(false);
         for p in allowed {
             self.possibility_space[idx].set(p.0, true);
         }
-        self.propagate(model);
+        self.propagate(model, propagation_budget).await;
+        Ok(())
     }
 
     pub fn size(&self) -> Vec2<usize> {
@@ -483,14 +544,30 @@ impl WfcSolver {
         (current, total)
     }
 
-    pub fn collapse_step<const N: usize, T: Copy>(
+    pub async fn collapse<const N: usize, T: Copy>(
         &mut self,
         model: &WfcModel<N, T>,
         rng: &mut impl Rng,
+        propagation_budget: usize,
     ) -> WfcCollapseResult<T> {
-        if !model.finalized {
-            return WfcCollapseResult::ModelNotFinalized;
+        loop {
+            match self.collapse_step(model, rng, propagation_budget).await {
+                None => continue,
+                Some(result) => return result,
+            }
         }
+    }
+
+    pub async fn collapse_step<const N: usize, T: Copy>(
+        &mut self,
+        model: &WfcModel<N, T>,
+        rng: &mut impl Rng,
+        propagation_budget: usize,
+    ) -> Option<WfcCollapseResult<T>> {
+        if !model.finalized {
+            return Some(WfcCollapseResult::ModelNotFinalized);
+        }
+
         self.iterations += 1;
 
         let mut best_entropy = f64::INFINITY;
@@ -549,7 +626,7 @@ impl WfcSolver {
                 }
             }
             if candidates.is_empty() {
-                return WfcCollapseResult::Impossible;
+                return Some(WfcCollapseResult::Impossible);
             }
 
             let total_weight: f64 = candidates.iter().map(|(_, w)| *w).sum();
@@ -563,12 +640,12 @@ impl WfcSolver {
                 }
             }
 
-            self.propagate(model);
-            WfcCollapseResult::Incomplete
+            self.propagate(model, propagation_budget).await;
+            None
         } else {
             for cell in &self.possibility_space {
                 if cell.not_any() {
-                    return WfcCollapseResult::Impossible;
+                    return Some(WfcCollapseResult::Impossible);
                 }
             }
 
@@ -584,45 +661,54 @@ impl WfcSolver {
                     grid.set((x, y), model.patterns[p].grid.get(offset).unwrap());
                 }
             }
-            WfcCollapseResult::Complete { grid }
+            Some(WfcCollapseResult::Complete { grid })
         }
     }
 
-    pub fn collapse<const N: usize, T: Copy>(
-        &mut self,
-        model: &WfcModel<N, T>,
-        rng: &mut impl Rng,
-    ) -> WfcCollapseResult<T> {
-        loop {
-            match self.collapse_step(model, rng) {
-                WfcCollapseResult::Incomplete => continue,
-                result => return result,
-            }
-        }
-    }
-
-    pub async fn collapse_async<const N: usize, T: Copy>(
-        &mut self,
-        model: &WfcModel<N, T>,
-        rng: &mut impl Rng,
-    ) -> WfcCollapseResult<T> {
-        std::future::poll_fn(|cx| match self.collapse_step(model, rng) {
-            WfcCollapseResult::Incomplete => {
-                cx.waker().wake_by_ref();
-                std::task::Poll::Pending
-            }
-            result => std::task::Poll::Ready(result),
-        })
-        .await
-    }
-
-    fn propagate<const N: usize, T: Copy>(&mut self, model: &WfcModel<N, T>) {
-        let mut stack: Vec<(usize, usize)> = (0..self.size.y)
+    fn propagate<'b, const N: usize, T: Copy>(
+        &'b mut self,
+        model: &'b WfcModel<N, T>,
+        budget: usize,
+    ) -> WfcPropagationFuture<'b, N, T> {
+        let stack: Vec<(usize, usize)> = (0..self.size.y)
             .flat_map(|y| (0..self.size.x).map(move |x| (x, y)))
             .collect();
+        WfcPropagationFuture {
+            solver: self,
+            model,
+            budget,
+            stack,
+        }
+    }
 
-        while let Some((x, y)) = stack.pop() {
-            let idx = self.index(x, y);
+    fn index(&self, x: usize, y: usize) -> usize {
+        y * self.size.x + x
+    }
+
+    fn safe_index(&self, x: usize, y: usize) -> Option<usize> {
+        if x < self.size.x && y < self.size.y {
+            Some(self.index(x, y))
+        } else {
+            None
+        }
+    }
+}
+
+pub struct WfcPropagationFuture<'a, const N: usize, T: Copy> {
+    solver: &'a mut WfcSolver,
+    model: &'a WfcModel<N, T>,
+    budget: usize,
+    stack: Vec<(usize, usize)>,
+}
+
+impl<'a, const N: usize, T: Copy> Future for WfcPropagationFuture<'a, N, T> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let mut processed = 0;
+
+        while let Some((x, y)) = self.stack.pop() {
+            let idx = self.solver.index(x, y);
             for &dir in &[
                 GridDirection::North,
                 GridDirection::East,
@@ -631,34 +717,38 @@ impl WfcSolver {
             ] {
                 let (nx, ny) = match dir {
                     GridDirection::North if y > 0 => (x, y - 1),
-                    GridDirection::South if y + 1 < self.size.y => (x, y + 1),
+                    GridDirection::South if y + 1 < self.solver.size.y => (x, y + 1),
                     GridDirection::West if x > 0 => (x - 1, y),
-                    GridDirection::East if x + 1 < self.size.x => (x + 1, y),
+                    GridDirection::East if x + 1 < self.solver.size.x => (x + 1, y),
                     _ => continue,
                 };
-                let nidx = self.index(nx, ny);
+                let nidx = self.solver.index(nx, ny);
 
-                let mut allowed = BitVec::repeat(false, model.patterns.len());
-                for a in 0..model.patterns.len() {
-                    if self.possibility_space[idx][a]
-                        && let Some(compat) = model.compatibility.get(&(PatternId(a), dir))
+                let mut allowed = BitVec::repeat(false, self.model.patterns.len());
+                for a in 0..self.model.patterns.len() {
+                    if self.solver.possibility_space[idx][a]
+                        && let Some(compat) = self.model.compatibility.get(&(PatternId(a), dir))
                     {
                         allowed |= compat.clone();
                     }
                 }
 
-                let before = self.possibility_space[nidx].clone();
-                self.possibility_space[nidx] &= allowed;
+                let before = self.solver.possibility_space[nidx].clone();
+                self.solver.possibility_space[nidx] &= allowed;
 
-                if self.possibility_space[nidx] != before {
-                    stack.push((nx, ny));
+                if self.solver.possibility_space[nidx] != before {
+                    self.stack.push((nx, ny));
                 }
             }
-        }
-    }
 
-    fn index(&self, x: usize, y: usize) -> usize {
-        y * self.size.x + x
+            processed += 1;
+            if self.budget > 0 && processed >= self.budget {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+        }
+
+        Poll::Ready(())
     }
 }
 
@@ -668,9 +758,9 @@ mod tests {
     use image::{GenericImageView, Pixel, RgbaImage};
     use rand::SeedableRng;
 
-    #[test]
+    #[pollster::test]
     #[cfg(feature = "diagnostics")]
-    fn test_model_overlapping() {
+    async fn test_model_overlapping() {
         let grid = Grid::with_buffer(
             (5, 5),
             vec![
@@ -683,10 +773,11 @@ mod tests {
         )
         .unwrap();
 
-        let mut model = WfcModel::<3, _>::new().unwrap();
-        model
-            .learn_overlapping_from_grid(&grid, WfcLearningStrategy::default())
-            .unwrap();
+        let mut model = WfcModel::<3, _>::new_overlapping_from_grid(
+            &grid,
+            WfcOverlappingLearningStrategy::default(),
+        )
+        .unwrap();
         model.finalize(WfcWeightingStrategy::Frequency);
         std::fs::write(
             "resources/wfc-model-overlap.html",
@@ -696,11 +787,14 @@ mod tests {
 
         let mut solver = WfcSolver::new((5, 5), &model);
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        solver.set_cell(&model, (2, 2), &[PatternId(4)]);
+        solver
+            .set_cell(&model, (2, 2), &[PatternId(5)], 0)
+            .await
+            .unwrap();
 
-        match solver.collapse(&model, &mut rng) {
+        match solver.collapse(&model, &mut rng, 0).await {
             WfcCollapseResult::Complete { grid } => {
-                assert_eq!(solver.iterations(), 3);
+                assert_eq!(solver.iterations(), 14);
                 assert_eq!(
                     grid.buffer(),
                     vec![
@@ -715,17 +809,14 @@ mod tests {
             WfcCollapseResult::Impossible => {
                 panic!("WFC reported impossible for a solvable grid");
             }
-            WfcCollapseResult::Incomplete => {
-                panic!("WFC reported incomplete after solve");
-            }
             WfcCollapseResult::ModelNotFinalized => {
                 panic!("WFC model was not finalized");
             }
         }
     }
 
-    #[test]
-    fn test_wfc_learn_overlapping() {
+    #[pollster::test]
+    async fn test_solver_overlapping() {
         const OUTPUT_SIZE: Vec2<usize> = Vec2::new(40, 20);
 
         println!("Load input image...");
@@ -745,16 +836,11 @@ mod tests {
         let grid = Grid::with_buffer((width as usize, height as usize), pixels).unwrap();
 
         println!("Learn patterns from image grid...");
-        let mut model = WfcModel::<3, _>::new().unwrap();
-        model
-            .learn_overlapping_from_grid(
-                &grid,
-                WfcLearningStrategy {
-                    augment_mirror_horizontal: true,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let mut model = WfcModel::<3, _>::new_overlapping_from_grid(
+            &grid,
+            WfcOverlappingLearningStrategy::default().periodic_horizontal(true),
+        )
+        .unwrap();
         model.finalize(WfcWeightingStrategy::Frequency);
         println!("Learned {} patterns", model.patterns().len());
 
@@ -770,8 +856,7 @@ mod tests {
         }
 
         println!("Solve WFC to generate output grid...");
-        let mut solver = WfcSolver::new(OUTPUT_SIZE, &model)
-            .with_desired_starting_location((OUTPUT_SIZE.x / 2, OUTPUT_SIZE.y - 1));
+        let mut solver = WfcSolver::new(OUTPUT_SIZE, &model);
 
         let ground = model
             .patterns()
@@ -788,13 +873,16 @@ mod tests {
             })
             .map(|p| p.id)
             .expect("No ground pattern found!");
-        solver.set_cell(&model, solver.desired_starting_location.unwrap(), &[ground]);
+        solver
+            .set_cell(&model, (OUTPUT_SIZE.x / 2, OUTPUT_SIZE.y - 2), &[ground], 0)
+            .await
+            .unwrap();
 
         let mut rng = rand::rng();
         let result = loop {
             let (current, total) = solver.uncertainty();
-            match solver.collapse_step(&model, &mut rng) {
-                WfcCollapseResult::Incomplete => {
+            match solver.collapse_step(&model, &mut rng, 0).await {
+                None => {
                     println!(
                         "WFC collapse | iterations: {} | uncertainty: {}/{}",
                         solver.iterations(),
@@ -803,7 +891,7 @@ mod tests {
                     );
                     continue;
                 }
-                result => {
+                Some(result) => {
                     println!(
                         "WFC collapsed | iterations: {} | uncertainty: {}/{}",
                         solver.iterations(),
@@ -834,9 +922,6 @@ mod tests {
             }
             WfcCollapseResult::Impossible => {
                 panic!("WFC reported impossible for image input");
-            }
-            WfcCollapseResult::Incomplete => {
-                panic!("WFC reported incomplete after solve");
             }
             WfcCollapseResult::ModelNotFinalized => {
                 panic!("WFC model was not finalized");
