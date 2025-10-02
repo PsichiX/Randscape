@@ -1,3 +1,5 @@
+pub mod auto_tile;
+
 use crate::grid::Grid;
 use noise::NoiseFn;
 use std::ops::{Add, Div, Mul, Range, Sub};

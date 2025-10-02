@@ -100,25 +100,32 @@ impl<T: Copy> Grid<T> {
         result
     }
 
+    pub fn apply_at(
+        &mut self,
+        locations: impl IntoIterator<Item = Vec2<usize>>,
+        mut generator: impl GridGenetator<T>,
+    ) {
+        for location in locations {
+            let index = self.index(location);
+            self.buffer[index] = generator.generate(location, self.size, self.buffer[index], self);
+        }
+    }
+
     pub fn apply(
         &mut self,
         from: impl Into<Vec2<usize>>,
         to: impl Into<Vec2<usize>>,
-        mut generator: impl GridGenetator<T>,
+        generator: impl GridGenetator<T>,
     ) {
         if self.buffer.is_empty() {
             return;
         }
         let from = from.into();
         let to = to.into();
-        for y in from.y..to.y {
-            for x in from.x..to.x {
-                let location = Vec2::new(x, y);
-                let index = self.index(location);
-                self.buffer[index] =
-                    generator.generate(location, self.size, self.buffer[index], self);
-            }
-        }
+        self.apply_at(
+            (from.y..to.y).flat_map(|y| (from.x..to.x).map(move |x| Vec2::new(x, y))),
+            generator,
+        );
     }
 
     pub fn apply_all(&mut self, generator: impl GridGenetator<T>) {
